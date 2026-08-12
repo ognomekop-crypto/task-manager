@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
 
+use task_manager::cloudflare::CloudflareClient;
 use task_manager::config::Config;
 use task_manager::crypto::Crypto;
 use task_manager::logger::LogManager;
@@ -54,15 +55,59 @@ async fn main() {
         None
     };
 
+    let cloudflare = if let Some(ref pwd) = password {
+        if let Some(ref salt) = config.password_salt {
+            if let Some(ref verifier) = config.password_verifier {
+                if Crypto::verify_password(verifier, pwd, salt) {
+                    let api_token = config.cloudflare_api_token_encrypted.as_ref()
+                        .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok());
+                    let api_email = config.cloudflare_api_email_encrypted.as_ref()
+                        .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok());
+                    match (api_token, api_email) {
+                        (Some(token), Some(email)) if !email.is_empty() => {
+                            log_manager.log("Cloudflare Global API Key loaded".to_string());
+                            Some(CloudflareClient::with_global_key(email, token))
+                        }
+                        (Some(token), _) if !token.is_empty() => {
+                            log_manager.log("Cloudflare API Token loaded".to_string());
+                            Some(CloudflareClient::with_token(token))
+                        }
+                        _ => {
+                            log_manager.log("Cloudflare credentials not configured".to_string());
+                            None
+                        }
+                    }
+                } else {
+                    log_manager.log("Invalid password provided".to_string());
+                    None
+                }
+            } else {
+                log_manager.log("No password verifier found".to_string());
+                None
+            }
+        } else {
+            log_manager.log("No password salt found".to_string());
+            None
+        }
+    } else if config.password_verifier.is_some() {
+        log_manager.log("Password required but not provided - Cloudflare disabled".to_string());
+        None
+    } else {
+        None
+    };
+
     let tasks = Arc::new(Mutex::new(config.tasks.clone()));
 
     let (sched_tx, sched_rx) = mpsc::channel(100);
     let log_tx = log_manager.tx.clone();
     let tasks_clone = tasks.clone();
     tokio::spawn(async move {
-        let scheduler = Scheduler::new(tasks_clone, pushover, log_tx);
+        let scheduler = Scheduler::new(tasks_clone, pushover, cloudflare, log_tx);
         scheduler.run(sched_rx).await;
     });
+
+    // Run startup-triggered tasks once the scheduler is ready
+    let _ = sched_tx.send(SchedulerCommand::RunStartupTasks).await;
 
     let (smtp_tx, mut smtp_rx) = mpsc::channel(100);
     let sched_tx_bridge = sched_tx.clone();
