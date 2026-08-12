@@ -6,9 +6,13 @@ pub struct Config {
     pub smtp_port: u16,
     pub pushover_app_token_encrypted: Option<Vec<u8>>,
     pub pushover_user_key_encrypted: Option<Vec<u8>>,
+    pub cloudflare_api_token_encrypted: Option<Vec<u8>>,
+    pub cloudflare_api_email_encrypted: Option<Vec<u8>>,
     pub password_verifier: Option<Vec<u8>>,
     pub password_salt: Option<Vec<u8>>,
     pub tasks: Vec<crate::task::Task>,
+    #[serde(default)]
+    pub public_ip: Option<String>,
 }
 
 impl Config {

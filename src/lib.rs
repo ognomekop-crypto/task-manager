@@ -7,5 +7,6 @@ pub mod scheduler;
 pub mod smtp;
 pub mod ntfy_listener;
 pub mod task;
+pub mod cloudflare;
 
 pub use app::App;

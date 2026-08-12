@@ -18,6 +18,7 @@ pub enum TriggerType {
         title_pattern: String,
         message_pattern: String,
     },
+    Startup,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,6 +65,16 @@ pub enum TaskType {
         action: NtfyAction,
         subscribe_timeout_secs: u64,
     },
+    GetPublicIp,
+    CloudflareDnsUpdate {
+        zone_id: String,
+        record_name: String,
+        record_type: String,
+        record_id: String,
+        content: String,
+        proxied: bool,
+        ttl: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -101,6 +112,8 @@ pub struct Task {
     pub last_triggered_date: Option<chrono::NaiveDate>,
     #[serde(skip)]
     pub interval_last_run: Option<DateTime<Local>>,
+    pub on_success_task_id: Option<Uuid>,
+    pub on_failure_task_id: Option<Uuid>,
 }
 
 impl Default for Task {
@@ -124,6 +137,8 @@ impl Default for Task {
             last_error: None,
             last_triggered_date: None,
             interval_last_run: None,
+            on_success_task_id: None,
+            on_failure_task_id: None,
         }
     }
 }
@@ -177,6 +192,7 @@ impl Task {
                 let filter = if parts.is_empty() { "any".to_string() } else { parts.join(", ") };
                 format!("ntfy {}/{} ({})", server.trim_end_matches('/'), topic, filter)
             }
+            TriggerType::Startup => "On service startup".to_string(),
         }
     }
 
@@ -193,6 +209,10 @@ impl Task {
                     NtfyAction::Subscribe => "SUB",
                 };
                 format!("ntfy {} {}/{}", action_str, server, topic)
+            }
+            TaskType::GetPublicIp => "Get Public IP".to_string(),
+            TaskType::CloudflareDnsUpdate { zone_id, record_name, record_type, .. } => {
+                format!("Cloudflare {} {} (zone: {})", record_type, record_name, zone_id)
             }
         }
     }
