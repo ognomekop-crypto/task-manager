@@ -2,6 +2,14 @@ use chrono::{DateTime, Local, Weekday};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Default)]
+pub struct NtfyContext {
+    pub topic: String,
+    pub title: String,
+    pub message: String,
+    pub tags: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TriggerType {
     Time { hour: u8, minute: u8 },
@@ -19,6 +27,7 @@ pub enum TriggerType {
         message_pattern: String,
     },
     Startup,
+    OnDemand,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -74,6 +83,12 @@ pub enum TaskType {
         content: String,
         proxied: bool,
         ttl: u32,
+        #[serde(skip)]
+        api_token_plain: Option<String>,
+        #[serde(skip)]
+        api_email_plain: Option<String>,
+        api_token_encrypted: Option<Vec<u8>>,
+        api_email_encrypted: Option<Vec<u8>>,
     },
 }
 
@@ -114,6 +129,8 @@ pub struct Task {
     pub interval_last_run: Option<DateTime<Local>>,
     pub on_success_task_id: Option<Uuid>,
     pub on_failure_task_id: Option<Uuid>,
+    #[serde(skip)]
+    pub ntfy_context: Option<NtfyContext>,
 }
 
 impl Default for Task {
@@ -139,6 +156,7 @@ impl Default for Task {
             interval_last_run: None,
             on_success_task_id: None,
             on_failure_task_id: None,
+            ntfy_context: None,
         }
     }
 }
@@ -193,6 +211,7 @@ impl Task {
                 format!("ntfy {}/{} ({})", server.trim_end_matches('/'), topic, filter)
             }
             TriggerType::Startup => "On service startup".to_string(),
+            TriggerType::OnDemand => "On demand (chained)".to_string(),
         }
     }
 

@@ -32,6 +32,8 @@ pub struct App {
     settings_user_key: String,
     settings_cloudflare_token: String,
     settings_cloudflare_email: String,
+    settings_cloudflare_zone_id: String,
+    settings_cloudflare_record_name: String,
     settings_new_password: String,
     settings_confirm_password: String,
 
@@ -72,6 +74,8 @@ impl App {
             settings_user_key: String::new(),
             settings_cloudflare_token: String::new(),
             settings_cloudflare_email: String::new(),
+            settings_cloudflare_zone_id: String::new(),
+            settings_cloudflare_record_name: String::new(),
             settings_new_password: String::new(),
             settings_confirm_password: String::new(),
             log_lines: Vec::new(),
@@ -241,21 +245,22 @@ impl App {
     fn save_config(&mut self) {
         let latest = Config::load();
         let mut config = self.config.clone();
+        // Only merge public_ip from disk — the service writes this, the GUI never does
         if latest.public_ip.is_some() {
             config.public_ip = latest.public_ip;
-        }
-        if latest.cloudflare_api_token_encrypted.is_some() {
-            config.cloudflare_api_token_encrypted = latest.cloudflare_api_token_encrypted;
-        }
-        if latest.cloudflare_api_email_encrypted.is_some() {
-            config.cloudflare_api_email_encrypted = latest.cloudflare_api_email_encrypted;
         }
         config.tasks = self.tasks.clone();
 
         if let Err(e) = config.save() {
             self.push_log(format!("Failed to save config: {}", e));
         } else {
-            self.push_log("Configuration saved".to_string());
+            self.push_log(format!(
+                "Config saved. token={} email={} zone='{}' record='{}'",
+                config.cloudflare_api_token_encrypted.is_some(),
+                config.cloudflare_api_email_encrypted.is_some(),
+                config.cloudflare_default_zone_id,
+                config.cloudflare_default_record_name
+            ));
             self.config = config;
         }
     }
@@ -265,7 +270,12 @@ impl App {
             self.config.smtp_port = port;
         }
 
-        if !self.settings_new_password.is_empty() {
+        let saving_pushover = !self.settings_app_token.is_empty() || !self.settings_user_key.is_empty();
+        let saving_cloudflare = !self.settings_cloudflare_token.is_empty() || !self.settings_cloudflare_email.is_empty();
+        let will_set_password = !self.settings_new_password.is_empty();
+
+        // Process new password FIRST so subsequent credential encryption has a key
+        if will_set_password {
             if self.settings_new_password != self.settings_confirm_password {
                 self.password_error = "Passwords do not match".to_string();
                 return;
@@ -281,6 +291,12 @@ impl App {
             self.settings_confirm_password.clear();
         }
 
+        let has_password = self.config.password_verifier.is_some();
+        if (saving_pushover || saving_cloudflare) && !has_password {
+            self.password_error = "A master password is required to encrypt credentials. Set one in the Master Password section below.".to_string();
+            return;
+        }
+
         if !self.settings_app_token.is_empty() && !self.settings_user_key.is_empty() {
             if let Some(ref salt) = self.config.password_salt {
                 if let Ok(enc_app) = Crypto::encrypt(&self.settings_app_token, &self.master_password, salt) {
@@ -292,15 +308,31 @@ impl App {
             }
         }
 
+        // Cloudflare token
         let cf_token = self.settings_cloudflare_token.trim();
         if !cf_token.is_empty() {
-            if let Some(ref salt) = self.config.password_salt {
-                if let Ok(enc_token) = Crypto::encrypt(cf_token, &self.master_password, salt) {
-                    self.config.cloudflare_api_token_encrypted = Some(enc_token);
+            match self.config.password_salt {
+                Some(ref salt) => {
+                    match Crypto::encrypt(cf_token, &self.master_password, salt) {
+                        Ok(enc_token) => {
+                            self.config.cloudflare_api_token_encrypted = Some(enc_token);
+                            self.push_log("Cloudflare token encrypted and stored".to_string());
+                        }
+                        Err(e) => {
+                            self.push_log(format!("ERROR: Failed to encrypt Cloudflare token: {}", e));
+                        }
+                    }
+                }
+                None => {
+                    self.push_log("ERROR: Cannot encrypt Cloudflare token — no password salt set".to_string());
                 }
             }
+        } else {
+            self.config.cloudflare_api_token_encrypted = None;
+            self.push_log("Cloudflare token cleared".to_string());
         }
 
+        // Cloudflare email
         let cf_email = self.settings_cloudflare_email.trim();
         if !cf_email.is_empty() {
             if let Some(ref salt) = self.config.password_salt {
@@ -311,6 +343,18 @@ impl App {
         } else {
             self.config.cloudflare_api_email_encrypted = None;
         }
+
+        // Defaults
+        self.config.cloudflare_default_zone_id = self.settings_cloudflare_zone_id.trim().to_string();
+        self.config.cloudflare_default_record_name = self.settings_cloudflare_record_name.trim().to_string();
+
+        self.push_log(format!(
+            "Settings prepared: zone_id='{}' record_name='{}' token_present={} email_present={}",
+            self.config.cloudflare_default_zone_id,
+            self.config.cloudflare_default_record_name,
+            self.config.cloudflare_api_token_encrypted.is_some(),
+            self.config.cloudflare_api_email_encrypted.is_some()
+        ));
 
         self.save_config();
         self.show_settings = false;
@@ -359,7 +403,20 @@ impl App {
     fn edit_selected_task(&mut self) {
         if let Some(idx) = self.selected_task_idx {
             if idx < self.tasks.len() {
-                self.editing_task = Some(self.tasks[idx].clone());
+                let mut task = self.tasks[idx].clone();
+                if let TaskType::CloudflareDnsUpdate { ref mut api_token_plain, ref mut api_email_plain, ref api_token_encrypted, ref api_email_encrypted, .. } = task.task_type {
+                    if self.password_verified {
+                        if let Some(ref salt) = self.config.password_salt {
+                            if let Some(ref enc) = api_token_encrypted {
+                                *api_token_plain = Crypto::decrypt(enc, &self.master_password, salt).ok();
+                            }
+                            if let Some(ref enc) = api_email_encrypted {
+                                *api_email_plain = Crypto::decrypt(enc, &self.master_password, salt).ok();
+                            }
+                        }
+                    }
+                }
+                self.editing_task = Some(task);
             }
         }
     }
@@ -374,12 +431,66 @@ impl App {
         }
     }
 
+    fn run_now_task(&mut self) {
+        // Extract task info BEFORE save_task() consumes editing_task
+        let (task_id, task_name) = if let Some(ref task) = self.editing_task {
+            (task.id, task.name.clone())
+        } else {
+            return;
+        };
+        // Save first so the service has the latest task definition
+        self.save_task();
+        // Write command file
+        let command = serde_json::json!({
+            "action": "run_task",
+            "task_id": task_id.to_string(),
+        });
+        let cmd_path = Config::config_path().with_file_name("command.json");
+        match std::fs::write(&cmd_path, command.to_string()) {
+            Ok(_) => {
+                self.push_log(format!("Run Now queued for task: {}", task_name));
+                // Start service if not running so it can pick up the command
+                if !self.is_service_running() {
+                    self.start_service();
+                }
+            }
+            Err(e) => {
+                self.push_log(format!("Failed to queue Run Now: {}", e));
+            }
+        }
+    }
+
     fn save_task(&mut self) {
         if let Some(mut task) = self.editing_task.take() {
             if let TaskType::FileChanged { ref file_path, ref mut baseline_hash } = task.task_type {
                 *baseline_hash = Self::compute_file_hash(file_path);
             }
-
+            if let TaskType::CloudflareDnsUpdate { ref mut api_token_encrypted, ref mut api_email_encrypted, ref mut api_token_plain, ref mut api_email_plain, .. } = task.task_type {
+                if self.password_verified && !self.master_password.is_empty() {
+                    if let Some(ref salt) = self.config.password_salt {
+                        if let Some(ref plain) = api_token_plain {
+                            if !plain.is_empty() {
+                                if let Ok(enc) = Crypto::encrypt(plain, &self.master_password, salt) {
+                                    *api_token_encrypted = Some(enc);
+                                }
+                            } else {
+                                *api_token_encrypted = None;
+                            }
+                        }
+                        if let Some(ref plain) = api_email_plain {
+                            if !plain.is_empty() {
+                                if let Ok(enc) = Crypto::encrypt(plain, &self.master_password, salt) {
+                                    *api_email_encrypted = Some(enc);
+                                }
+                            } else {
+                                *api_email_encrypted = None;
+                            }
+                        }
+                    }
+                }
+                *api_token_plain = None;
+                *api_email_plain = None;
+            }
             if let Some(idx) = self.tasks.iter().position(|t| t.id == task.id) {
                 self.tasks[idx] = task;
             } else {
@@ -544,6 +655,7 @@ impl eframe::App for App {
                         TriggerType::Email { .. } => "Email",
                         TriggerType::Ntfy { .. } => "ntfy.sh",
                         TriggerType::Startup => "Startup",
+                        TriggerType::OnDemand => "On Demand",
                     };
                     egui::ComboBox::new("trigger_combo", "")
                         .selected_text(trigger_text)
@@ -554,6 +666,7 @@ impl eframe::App for App {
                             ui.selectable_value(&mut task.trigger, TriggerType::Email { from_pattern: String::new(), subject_pattern: String::new(), body_pattern: String::new() }, "Email");
                             ui.selectable_value(&mut task.trigger, TriggerType::Ntfy { server: "https://ntfy.sh".to_string(), topic: String::new(), title_pattern: String::new(), message_pattern: String::new() }, "ntfy.sh");
                             ui.selectable_value(&mut task.trigger, TriggerType::Startup, "Startup");
+                            ui.selectable_value(&mut task.trigger, TriggerType::OnDemand, "On Demand");
                         });
 
                     match &mut task.trigger {
@@ -632,6 +745,9 @@ impl eframe::App for App {
                         TriggerType::Startup => {
                             ui.label("This task runs once when the service starts.");
                         }
+                        TriggerType::OnDemand => {
+                            ui.label("This task only runs when called by another task via task chaining.");
+                        }
                     }
 
                     ui.separator();
@@ -656,7 +772,7 @@ impl eframe::App for App {
                             ui.selectable_value(&mut task.task_type, TaskType::FileChanged { file_path: String::new(), baseline_hash: None }, "File Changed");
                             ui.selectable_value(&mut task.task_type, TaskType::Ntfy { server: "https://ntfy.sh".to_string(), topic: String::new(), title: String::new(), message: String::new(), priority: "default".to_string(), tags: String::new(), action: crate::task::NtfyAction::Publish, subscribe_timeout_secs: 30 }, "ntfy.sh");
                             ui.selectable_value(&mut task.task_type, TaskType::GetPublicIp, "Get Public IP");
-                            ui.selectable_value(&mut task.task_type, TaskType::CloudflareDnsUpdate { zone_id: String::new(), record_name: String::new(), record_type: "A".to_string(), record_id: String::new(), content: String::new(), proxied: false, ttl: 1 }, "Cloudflare DNS");
+                            ui.selectable_value(&mut task.task_type, TaskType::CloudflareDnsUpdate { zone_id: String::new(), record_name: String::new(), record_type: "A".to_string(), record_id: String::new(), content: String::new(), proxied: false, ttl: 60, api_token_plain: None, api_email_plain: None, api_token_encrypted: None, api_email_encrypted: None }, "Cloudflare DNS");
                         });
 
                     match &mut task.task_type {
@@ -758,7 +874,7 @@ impl eframe::App for App {
                             ui.label("Fetches the public IP address and saves it to the config file.");
                             ui.label("Use {{public_ip}} in ntfy title or message fields to reference it.");
                         }
-                        TaskType::CloudflareDnsUpdate { zone_id, record_name, record_type, record_id, content, proxied, ttl } => {
+                        TaskType::CloudflareDnsUpdate { zone_id, record_name, record_type, record_id, content, proxied, ttl, api_token_plain, api_email_plain, .. } => {
                             ui.horizontal(|ui| {
                                 ui.label("Zone ID:");
                                 ui.add(egui::TextEdit::singleline(zone_id).desired_width(300.0));
@@ -784,7 +900,17 @@ impl eframe::App for App {
                                 ui.add(egui::DragValue::new(ttl).speed(1.0).clamp_range(1u32..=86400u32));
                             });
                             ui.checkbox(proxied, "Proxied");
-                            ui.label("The Cloudflare API token is configured in Settings.");
+                            ui.separator();
+                            ui.label("Per-Task Cloudflare Credentials (optional — leave empty to use global settings)");
+                            ui.horizontal(|ui| {
+                                ui.label("API Token:");
+                                ui.add(egui::TextEdit::singleline(api_token_plain.get_or_insert_with(String::new)).password(true).hint_text("Leave empty for global default"));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Account Email:");
+                                ui.add(egui::TextEdit::singleline(api_email_plain.get_or_insert_with(String::new)).password(true).hint_text("Only for Global API Key"));
+                            });
+                            ui.label("Leave empty to use the global token from Settings.");
                         }
                     }
 
@@ -856,6 +982,9 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         if ui.button("Save Task").clicked() {
                             save_clicked = true;
+                        }
+                        if ui.button("Run Now").clicked() {
+                            self.run_now_task();
                         }
                         if ui.button("Cancel").clicked() {
                             cancel_clicked = true;
@@ -951,6 +1080,10 @@ impl eframe::App for App {
                     ui.add(egui::TextEdit::singleline(&mut self.settings_cloudflare_token).password(true).hint_text("Leave empty to keep existing"));
                     ui.label("Account Email (only for Global API Key):");
                     ui.add(egui::TextEdit::singleline(&mut self.settings_cloudflare_email).password(true).hint_text("Leave empty when using API Token"));
+                    ui.label("Default Zone ID:");
+                    ui.add(egui::TextEdit::singleline(&mut self.settings_cloudflare_zone_id).desired_width(300.0).hint_text("Used when task Zone ID is empty"));
+                    ui.label("Default Record Name:");
+                    ui.add(egui::TextEdit::singleline(&mut self.settings_cloudflare_record_name).desired_width(300.0).hint_text("Used when task Record Name is empty"));
                     ui.label("Hint: API Tokens use Bearer auth. Global API Keys need email + key.");
 
                     ui.separator();

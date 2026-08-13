@@ -14,6 +14,7 @@ struct NtfyMessage {
     topic: String,
     title: String,
     message: String,
+    tags: String,
 }
 
 pub struct NtfyListener {
@@ -78,6 +79,7 @@ impl NtfyListener {
                             topic: msg.topic,
                             title: msg.title,
                             message: msg.message,
+                            tags: msg.tags,
                         }
                     ).await;
                 }
@@ -174,6 +176,7 @@ async fn listen_topic(
                                         topic: topic.clone(),
                                         title: msg.title,
                                         message: msg.message,
+                                        tags: msg.tags,
                                     }).await;
                                 } else if !event_text.trim().is_empty() {
                                     let ev_type = event_text.lines()
@@ -242,6 +245,7 @@ fn find_boundary(buf: &[u8]) -> Option<usize> {
 struct ParsedNtfyMessage {
     title: String,
     message: String,
+    tags: String,
 }
 
 fn parse_sse_message(event_text: &str) -> Option<ParsedNtfyMessage> {
@@ -273,6 +277,12 @@ fn parse_sse_message(event_text: &str) -> Option<ParsedNtfyMessage> {
         }
         if let Some(m) = json.get("message").and_then(|v| v.as_str()) {
             msg.message = m.to_string();
+        }
+        if let Some(tags_arr) = json.get("tags").and_then(|v| v.as_array()) {
+            let tags: Vec<String> = tags_arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            msg.tags = tags.join(", ");
         }
     }
 

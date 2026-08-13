@@ -1,4 +1,5 @@
 use crate::cloudflare::CloudflareClient;
+use crate::crypto::Crypto;
 use crate::pushover::PushoverClient;
 use crate::task::{Task, TaskType, TriggerType};
 use crate::smtp::ReceivedEmail;
@@ -14,8 +15,9 @@ use tokio::sync::{mpsc, Mutex};
 pub enum SchedulerCommand {
     UpdateTasks(Vec<Task>),
     EmailReceived(ReceivedEmail),
-    NtfyReceived { topic: String, title: String, message: String },
+    NtfyReceived { topic: String, title: String, message: String, tags: String },
     RunStartupTasks,
+    RunTaskNow(uuid::Uuid),
     Shutdown,
 }
 
@@ -24,6 +26,8 @@ pub struct Scheduler {
     pushover: Option<PushoverClient>,
     cloudflare: Option<CloudflareClient>,
     log_tx: std::sync::mpsc::Sender<String>,
+    master_password: Option<String>,
+    password_salt: Option<Vec<u8>>,
 }
 
 impl Scheduler {
@@ -32,8 +36,10 @@ impl Scheduler {
         pushover: Option<PushoverClient>,
         cloudflare: Option<CloudflareClient>,
         log_tx: std::sync::mpsc::Sender<String>,
+        master_password: Option<String>,
+        password_salt: Option<Vec<u8>>,
     ) -> Self {
-        Self { tasks, pushover, cloudflare, log_tx }
+        Self { tasks, pushover, cloudflare, log_tx, master_password, password_salt }
     }
 
     pub async fn run(&self, mut cmd_rx: mpsc::Receiver<SchedulerCommand>) {
@@ -52,11 +58,23 @@ impl Scheduler {
                         Some(SchedulerCommand::EmailReceived(email)) => {
                             self.handle_email(email).await;
                         }
-                        Some(SchedulerCommand::NtfyReceived { topic, title, message }) => {
-                            self.handle_ntfy(topic, title, message).await;
+                        Some(SchedulerCommand::NtfyReceived { topic, title, message, tags }) => {
+                            self.handle_ntfy(topic, title, message, tags).await;
                         }
                         Some(SchedulerCommand::RunStartupTasks) => {
                             self.run_startup_tasks().await;
+                        }
+                        Some(SchedulerCommand::RunTaskNow(task_id)) => {
+                            let tasks = self.tasks.lock().await;
+                            let task_names: Vec<String> = tasks.iter().map(|t| format!("{}={}", t.id, t.name)).collect();
+                            self.log(format!("Run Now: looking for {} in {} tasks: [{}]", task_id, tasks.len(), task_names.join(", ")));
+                            if let Some(task) = tasks.iter().find(|t| t.id == task_id).cloned() {
+                                drop(tasks);
+                                self.log(format!("Run Now executing task: {}", task.name));
+                                self.execute_task(task).await;
+                            } else {
+                                self.log(format!("Run Now failed: task {} not found in scheduler cache", task_id));
+                            }
                         }
                         Some(SchedulerCommand::Shutdown) | None => break,
                     }
@@ -116,6 +134,7 @@ impl Scheduler {
                     TriggerType::Email { .. } => false,
                     TriggerType::Ntfy { .. } => false,
                     TriggerType::Startup => false,
+                    TriggerType::OnDemand => false,
                 };
                 if should_run {
                     task.last_triggered_date = Some(today);
@@ -156,7 +175,7 @@ impl Scheduler {
         }
     }
 
-    async fn handle_ntfy(&self, topic: String, title: String, message: String) {
+    async fn handle_ntfy(&self, topic: String, title: String, message: String, tags: String) {
         let mut to_run = Vec::new();
         {
             let tasks = self.tasks.lock().await;
@@ -178,7 +197,14 @@ impl Scheduler {
                 }
             }
         }
-        for task in to_run {
+        let context = crate::task::NtfyContext {
+            topic: topic.clone(),
+            title: title.clone(),
+            message: message.clone(),
+            tags: tags.clone(),
+        };
+        for mut task in to_run {
+            task.ntfy_context = Some(context.clone());
             self.log(format!("ntfy trigger matched for task: {}", task.name));
             self.execute_task(task).await;
         }
@@ -196,24 +222,59 @@ impl Scheduler {
             }
 
             self.log(format!("Executing task: {}", task.name));
+            let ntfy = task.ntfy_context.as_ref();
             let result = match &task.task_type {
-                TaskType::HttpGet { url } => self.run_http_get(url).await,
-                TaskType::HttpPost { url, body, headers } => self.run_http_post(url, body, headers).await,
+                TaskType::HttpGet { url } => self.run_http_get(&self.substitute_variables(url, ntfy)).await,
+                TaskType::HttpPost { url, body, headers } => {
+                    self.run_http_post(
+                        &self.substitute_variables(url, ntfy),
+                        &self.substitute_variables(body, ntfy),
+                        &self.substitute_variables(headers, ntfy),
+                    ).await
+                }
                 TaskType::Command { command, args, working_dir } => {
-                    self.run_command(command, args, working_dir).await
+                    self.run_command(
+                        &self.substitute_variables(command, ntfy),
+                        &self.substitute_variables(args, ntfy),
+                        &self.substitute_variables(working_dir, ntfy),
+                    ).await
                 }
                 TaskType::PathCheck { path, check_file_exists, file_path } => {
-                    self.run_path_check(path, *check_file_exists, file_path).await
+                    self.run_path_check(
+                        &self.substitute_variables(path, ntfy),
+                        *check_file_exists,
+                        &self.substitute_variables(file_path, ntfy),
+                    ).await
                 }
                 TaskType::FileChanged { file_path, baseline_hash } => {
-                    self.run_file_changed(file_path, baseline_hash.as_deref()).await
+                    self.run_file_changed(&self.substitute_variables(file_path, ntfy), baseline_hash.as_deref()).await
                 }
                 TaskType::Ntfy { server, topic, title, message, priority, tags, action, subscribe_timeout_secs } => {
-                    self.run_ntfy(server, topic, title, message, priority, tags, action, *subscribe_timeout_secs).await
+                    self.run_ntfy(
+                        &self.substitute_variables(server, ntfy),
+                        &self.substitute_variables(topic, ntfy),
+                        &self.substitute_variables(title, ntfy),
+                        &self.substitute_variables(message, ntfy),
+                        &self.substitute_variables(priority, ntfy),
+                        &self.substitute_variables(tags, ntfy),
+                        action,
+                        *subscribe_timeout_secs,
+                        ntfy,
+                    ).await
                 }
                 TaskType::GetPublicIp => self.run_get_public_ip().await,
-                TaskType::CloudflareDnsUpdate { zone_id, record_name, record_type, record_id, content, proxied, ttl } => {
-                    self.run_cloudflare_dns_update(zone_id, record_name, record_type, record_id, content, *proxied, *ttl).await
+                TaskType::CloudflareDnsUpdate { zone_id, record_name, record_type, record_id, content, proxied, ttl, api_token_encrypted, api_email_encrypted, .. } => {
+                    self.run_cloudflare_dns_update(
+                        &self.substitute_variables(zone_id, ntfy),
+                        &self.substitute_variables(record_name, ntfy),
+                        record_type,
+                        &self.substitute_variables(record_id, ntfy),
+                        &self.substitute_variables(content, ntfy),
+                        *proxied,
+                        *ttl,
+                        api_token_encrypted.as_ref(),
+                        api_email_encrypted.as_ref(),
+                    ).await
                 }
             };
             let (success, error_msg) = match result {
@@ -223,20 +284,23 @@ impl Scheduler {
 
             let on_success_id = task.on_success_task_id;
             let on_failure_id = task.on_failure_task_id;
+            let ntfy_context = task.ntfy_context.clone();
 
             task.last_run = Some(Local::now());
             task.last_result = Some(success);
             task.last_error = error_msg.clone();
             if task.pushover_enabled && task.should_notify(success) {
                 if let Some(ref client) = self.pushover {
-                    let title = if success { &task.pushover_title_success } else { &task.pushover_title_failure };
-                    let message = if success { &task.pushover_message_success } else { &task.pushover_message_failure };
+                    let title_raw = if success { &task.pushover_title_success } else { &task.pushover_title_failure };
+                    let message_raw = if success { &task.pushover_message_success } else { &task.pushover_message_failure };
+                    let title = self.substitute_variables(title_raw, ntfy);
+                    let message = self.substitute_variables(message_raw, ntfy);
                     let msg = if let Some(ref err) = error_msg {
                         format!("{}: {}", message, err)
                     } else {
-                        message.clone()
+                        message
                     };
-                    let _ = client.send(title, &msg, task.pushover_priority, &task.pushover_sound).await;
+                    let _ = client.send(&title, &msg, task.pushover_priority, &task.pushover_sound).await;
                 }
             }
             self.log(format!(
@@ -251,18 +315,21 @@ impl Scheduler {
                 t.last_run = task.last_run;
                 t.last_result = task.last_result;
                 t.last_error = task.last_error.clone();
+                t.ntfy_context = task.ntfy_context.clone();
             }
             let on_success = on_success_id.and_then(|id| tasks.iter().find(|t| t.id == id).cloned());
             let on_failure = on_failure_id.and_then(|id| tasks.iter().find(|t| t.id == id).cloned());
             drop(tasks);
 
             if success {
-                if let Some(next) = on_success {
+                if let Some(mut next) = on_success {
+                    next.ntfy_context = ntfy_context.clone();
                     self.log(format!("Chaining to success task: {}", next.name));
                     self.execute_task_with_depth(next, chain_depth + 1).await;
                 }
             } else {
-                if let Some(next) = on_failure {
+                if let Some(mut next) = on_failure {
+                    next.ntfy_context = ntfy_context.clone();
                     self.log(format!("Chaining to failure task: {}", next.name));
                     self.execute_task_with_depth(next, chain_depth + 1).await;
                 }
@@ -389,36 +456,117 @@ impl Scheduler {
         content: &str,
         proxied: bool,
         ttl: u32,
+        api_token_encrypted: Option<&Vec<u8>>,
+        api_email_encrypted: Option<&Vec<u8>>,
     ) -> Result<bool, String> {
-        let client = self.cloudflare.as_ref().ok_or("Cloudflare credentials not configured")?;
+        // Try per-task credentials first
+        let per_task_client = if let (Some(ref pwd), Some(ref salt)) = (&self.master_password, &self.password_salt) {
+            if let Some(ref enc_token) = api_token_encrypted {
+                if let Ok(token) = Crypto::decrypt(enc_token, pwd, salt) {
+                    let email = api_email_encrypted
+                        .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok());
+                    if let Some(ref em) = email {
+                        Some(CloudflareClient::with_global_key(em.clone(), token))
+                    } else {
+                        Some(CloudflareClient::with_token(token))
+                    }
+                } else { None }
+            } else { None }
+        } else { None };
+
+        let client = per_task_client.as_ref().or(self.cloudflare.as_ref()).ok_or("Cloudflare credentials not configured")?;
+        self.log(format!(
+            "Cloudflare client: per_task={} global={}",
+            per_task_client.is_some(),
+            self.cloudflare.is_some()
+        ));
+
+        let config = crate::config::Config::load();
+        let mut default_zone_id = config.cloudflare_default_zone_id.clone();
+        let mut default_record_name = config.cloudflare_default_record_name.clone();
+
+        // Fallback: read raw JSON if struct fields are empty (handles old binary overwrite)
+        if default_zone_id.is_empty() || default_record_name.is_empty() {
+            if let Ok(raw) = std::fs::read_to_string(crate::config::Config::config_path()) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if default_zone_id.is_empty() {
+                        if let Some(z) = json.get("cloudflare_default_zone_id").and_then(|v| v.as_str()) {
+                            default_zone_id = z.to_string();
+                        }
+                    }
+                    if default_record_name.is_empty() {
+                        if let Some(r) = json.get("cloudflare_default_record_name").and_then(|v| v.as_str()) {
+                            default_record_name = r.to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        self.log(format!(
+            "Cloudflare defaults loaded: zone_id='{}' record_name='{}'",
+            default_zone_id, default_record_name
+        ));
+
+        let resolved_zone_id = if zone_id.is_empty() {
+            default_zone_id.as_str()
+        } else {
+            zone_id
+        };
+        let resolved_record_name = if record_name.is_empty() {
+            default_record_name.as_str()
+        } else {
+            record_name
+        };
+
+        self.log(format!(
+            "Cloudflare resolved: zone_id='{}' record_name='{}' (task empty: zone={} name={})",
+            resolved_zone_id, resolved_record_name, zone_id.is_empty(), record_name.is_empty()
+        ));
+
+        if resolved_zone_id.is_empty() {
+            return Err("Zone ID is empty and no default is configured in Settings".to_string());
+        }
+        if resolved_record_name.is_empty() {
+            return Err("Record Name is empty and no default is configured in Settings".to_string());
+        }
 
         let resolved_content = if content.is_empty() {
-            let config = crate::config::Config::load();
             config.public_ip.ok_or("No public IP saved in config. Run a GetPublicIp task first.")?
         } else {
-            self.substitute_variables(content)
+            self.substitute_variables(content, None)
         };
 
         let rid = if record_id.is_empty() {
-            client.find_record_id(zone_id, record_name, record_type).await?
-                .ok_or_else(|| format!("Could not find {} record '{}' in zone {}", record_type, record_name, zone_id))?
+            client.find_record_id(resolved_zone_id, resolved_record_name, record_type).await?
+                .ok_or_else(|| format!("Could not find {} record '{}' in zone {}", record_type, resolved_record_name, resolved_zone_id))?
         } else {
             record_id.to_string()
         };
 
         self.log(format!(
             "Cloudflare: updating {} record '{}' (zone: {}) to {} (TTL: {})",
-            record_type, record_name, zone_id, resolved_content, ttl
+            record_type, resolved_record_name, resolved_zone_id, resolved_content, ttl
         ));
 
-        client.update_dns_record(zone_id, &rid, record_type, record_name, &resolved_content, proxied, ttl).await
+        client.update_dns_record(resolved_zone_id, &rid, record_type, resolved_record_name, &resolved_content, proxied, ttl).await
     }
 
-    fn substitute_variables(&self, text: &str) -> String {
+    fn substitute_variables(&self, text: &str, ntfy: Option<&crate::task::NtfyContext>) -> String {
         let config = crate::config::Config::load();
         let mut result = text.to_string();
         if let Some(ip) = &config.public_ip {
             result = result.replace("{{public_ip}}", ip);
+        }
+        if let Some(ctx) = ntfy {
+            result = result.replace("{{ntfy_topic}}", &ctx.topic);
+            result = result.replace("{{ntfy_title}}", &ctx.title);
+            result = result.replace("{{ntfy_message}}", &ctx.message);
+            for (idx, tag) in ctx.tags.split(',').enumerate() {
+                let tag = tag.trim();
+                let placeholder = format!("{{{{ntfy_tags{}}}}}", idx + 1);
+                result = result.replace(&placeholder, tag);
+            }
         }
         result
     }
@@ -433,6 +581,7 @@ impl Scheduler {
         tags: &str,
         action: &crate::task::NtfyAction,
         timeout_secs: u64,
+        ntfy: Option<&crate::task::NtfyContext>,
     ) -> Result<bool, String> {
         let base = server.trim_end_matches('/');
         match action {
@@ -444,8 +593,8 @@ impl Scheduler {
                     .build()
                     .map_err(|e| e.to_string())?;
 
-                let sub_title = self.substitute_variables(title);
-                let sub_message = self.substitute_variables(message);
+                let sub_title = self.substitute_variables(title, ntfy);
+                let sub_message = self.substitute_variables(message, ntfy);
 
                 let mut req = client.post(&url).body(sub_message);
                 if !sub_title.is_empty() {

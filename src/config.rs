@@ -8,11 +8,12 @@ pub struct Config {
     pub pushover_user_key_encrypted: Option<Vec<u8>>,
     pub cloudflare_api_token_encrypted: Option<Vec<u8>>,
     pub cloudflare_api_email_encrypted: Option<Vec<u8>>,
+    pub cloudflare_default_zone_id: String,
+    pub cloudflare_default_record_name: String,
     pub password_verifier: Option<Vec<u8>>,
     pub password_salt: Option<Vec<u8>>,
-    pub tasks: Vec<crate::task::Task>,
-    #[serde(default)]
     pub public_ip: Option<String>,
+    pub tasks: Vec<crate::task::Task>,
 }
 
 impl Config {
