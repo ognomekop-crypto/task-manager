@@ -101,8 +101,10 @@ async fn main() {
     let (sched_tx, sched_rx) = mpsc::channel(100);
     let log_tx = log_manager.tx.clone();
     let tasks_clone = tasks.clone();
+    let master_password = password.clone();
+    let password_salt = config.password_salt.clone();
     tokio::spawn(async move {
-        let scheduler = Scheduler::new(tasks_clone, pushover, cloudflare, log_tx);
+        let scheduler = Scheduler::new(tasks_clone, pushover, cloudflare, log_tx, master_password, password_salt);
         scheduler.run(sched_rx).await;
     });
 
