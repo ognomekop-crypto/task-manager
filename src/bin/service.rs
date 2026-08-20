@@ -26,9 +26,11 @@ async fn main() {
             if let Some(ref verifier) = config.password_verifier {
                 if Crypto::verify_password(verifier, pwd, salt) {
                     let app_token = config.pushover_app_token_encrypted.as_ref()
-                        .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok());
+                        .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok())
+                        .map(|s| s.trim().to_string());
                     let user_key = config.pushover_user_key_encrypted.as_ref()
-                        .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok());
+                        .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok())
+                        .map(|s| s.trim().to_string());
                     if let (Some(app), Some(user)) = (app_token, user_key) {
                         log_manager.log("Pushover credentials loaded".to_string());
                         Some(PushoverClient::new(app, user))
@@ -60,9 +62,11 @@ async fn main() {
             if let Some(ref verifier) = config.password_verifier {
                 if Crypto::verify_password(verifier, pwd, salt) {
                     let api_token = config.cloudflare_api_token_encrypted.as_ref()
-                        .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok());
+                        .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok())
+                        .map(|s| s.trim().to_string());
                     let api_email = config.cloudflare_api_email_encrypted.as_ref()
-                        .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok());
+                        .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok())
+                        .map(|s| s.trim().to_string());
                     match (api_token, api_email) {
                         (Some(token), Some(email)) if !email.is_empty() => {
                             log_manager.log("Cloudflare Global API Key loaded".to_string());
