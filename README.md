@@ -16,11 +16,12 @@ A Rust-based task scheduler and automation tool with a native GUI and background
 ### Task Types
 - **HTTP GET / POST** — Make web requests with custom headers and body
 - **Command** — Execute shell commands via `cmd /C`
-- **Path Check** — Verify a directory or file exists
+- **Path Check** — Verify a directory or file exists (file path is resolved relative to the checked path)
 - **File Changed** — Detect when a file's SHA-256 hash changes from a baseline
 - **ntfy.sh** — Publish messages or subscribe to topics
 - **Get Public IP** — Fetch and save your public IP address
-- **Cloudflare DNS Update** — Automatically update DNS A/AAAA records, with **per-task encrypted credentials** or global fallback
+- **Cloudflare DNS Update** — Automatically update DNS A/AAAA records, with **per-task encrypted credentials**, global fallback defaults, and **variable substitution on all fields including proxied and TTL**
+- **Cloudflare IP List Update** — Add, remove, or replace IPs in Cloudflare Rules IP Lists (firewall allowlists/blocklists), with per-task credentials and list name lookup
 
 ### Variable Substitution
 When a task is triggered by an **ntfy.sh** message, the incoming message fields are available as variables in **any text field** of that task (including chained tasks):
@@ -40,7 +41,8 @@ These variables are substituted at execution time in:
 - Command arguments and working directories
 - Path and file check paths
 - ntfy publish title, message, topic, and tags
-- Cloudflare DNS record content
+- Cloudflare DNS **zone ID, record name, record ID, content, proxied, and TTL**
+- Cloudflare IP List **account ID, list ID, list name, IP, and comment**
 - **Pushover notification titles and messages**
 - Task chaining (the context propagates to chained tasks)
 
@@ -63,9 +65,9 @@ These variables are substituted at execution time in:
 - **Service Binary** (`task_manager_service`) — Background Tokio async runtime handling scheduling, SMTP, ntfy SSE listeners, and task execution
 - **GUI Binary** (`task_manager_gui`) — Native egui/eframe desktop application for task configuration, service control, log viewing, and settings
 - **Hot Reload** — Service automatically reloads `config.json` when modified
-- **Run Now** — Execute any task immediately from the GUI, bypassing its trigger
 - **Status File** — Service writes `status.json` for GUI polling of task run states
 - **Rotating Logs** — Daily log files with automatic 7-day cleanup
+- **Stable Config Directory** — Config and logs are stored alongside the executable, ensuring the service and GUI always share the same files regardless of working directory
 
 ## Building
 
@@ -86,7 +88,7 @@ This produces:
    cargo run --bin task_manager_gui
    ```
 
-2. Configure settings (master password, SMTP port, Pushover/Cloudflare credentials).
+2. Configure settings (master password, SMTP port, Pushover/Cloudflare credentials, and Cloudflare defaults).
 
 3. Start the service from the GUI or manually:
    ```bash
@@ -95,7 +97,7 @@ This produces:
 
 ## Configuration
 
-All settings and tasks are stored in `config.json` in the working directory:
+All settings and tasks are stored in `config.json` in the executable's directory:
 
 ```json
 {
@@ -104,6 +106,10 @@ All settings and tasks are stored in `config.json` in the working directory:
   "pushover_user_key_encrypted": "...",
   "cloudflare_api_token_encrypted": "...",
   "cloudflare_api_email_encrypted": "...",
+  "cloudflare_default_zone_id": "...",
+  "cloudflare_default_record_name": "...",
+  "cloudflare_default_proxied": "true",
+  "cloudflare_default_ttl": "60",
   "password_verifier": "...",
   "password_salt": "...",
   "public_ip": "1.2.3.4",
@@ -120,19 +126,37 @@ Each Cloudflare DNS Update task can store its own encrypted API token and accoun
 
 Leave these fields empty to fall back to the **global Cloudflare credentials** configured in Settings.
 
-### Default Zone ID & Record Name
+### Cloudflare IP Lists
 
-In **Settings → Cloudflare DNS**, you can also set:
+The **Cloudflare IP List Update** task type manages IP addresses in Cloudflare Rules IP Lists (used in firewall rules, access policies, etc.).
 
-- **Default Zone ID** — Used when a Cloudflare task leaves its Zone ID field empty
-- **Default Record Name** — Used when a Cloudflare task leaves its Record Name field empty
+Supported actions:
+- **Add** — Append an IP to the list. If the IP **already exists** in the list (regardless of comment), nothing is changed. If the IP is new but a **comment** is provided and an existing entry has the same comment, the old entry is deleted and the new one is added.
+- **Remove** — Delete an IP from the list (looks up by IP address)
+- **Replace All** — Clear the list and add only the specified IP
 
-This lets you create lightweight Cloudflare tasks that only specify the record type and content, inheriting the zone and hostname from global defaults. This allows you to:
-- Use different Cloudflare accounts for different DNS zones
-- Share a single `config.json` across environments without exposing all credentials
-- Keep global credentials as a default while overriding specific tasks
+Fields:
+- **Account ID** — Your Cloudflare account ID
+- **List ID** — The IP List ID (leave empty to look up by name)
+- **List Name** — Human-readable list name (used for lookup when List ID is empty)
+- **IP** — The IP address to manage (supports variable substitution, e.g. `{{public_ip}}`)
+- **Comment** — Optional note attached to the IP entry
+- **Action** — Add / Remove / Replace All
 
-Per-task credentials are encrypted with the same master password and salt as global credentials.
+Per-task credentials work the same way as Cloudflare DNS tasks.
+
+### Cloudflare Default Fields
+
+In **Settings → Cloudflare DNS**, you can set global defaults that apply when a task leaves the corresponding field empty:
+
+| Default | Purpose |
+|---------|---------|
+| **Zone ID** | Used when a Cloudflare task leaves its Zone ID field empty |
+| **Record Name** | Used when a Cloudflare task leaves its Record Name field empty |
+| **Proxied** | Used when a Cloudflare task leaves its Proxied field empty (e.g. `true` or `false`) |
+| **TTL** | Used when a Cloudflare task leaves its TTL field empty (e.g. `60`) |
+
+All four fields support **variable substitution**, so you can use `{{public_ip}}`, `{{ntfy_message}}`, etc. in any of them. This lets you create lightweight Cloudflare tasks that inherit most settings from global defaults while overriding specific values as needed.
 
 ## Dependencies
 
@@ -146,7 +170,6 @@ Per-task credentials are encrypted with the same master password and salt as glo
 | `aes-gcm` | Credential encryption |
 | `pbkdf2` / `hmac` / `sha2` | Key derivation & hashing |
 | `uuid` | Task identifiers |
-| `regex` | Pattern matching |
 | `parking_lot` | Synchronization primitives |
 | `dirs` | System paths |
 
