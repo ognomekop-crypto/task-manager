@@ -1,7 +1,7 @@
 use crate::cloudflare::CloudflareClient;
 use crate::crypto::Crypto;
 use crate::pushover::PushoverClient;
-use crate::task::{Task, TaskType, TriggerType};
+use crate::task::{IpListAction, NtfyAction, NtfyContext, Task, TaskType, TriggerType};
 use crate::smtp::ReceivedEmail;
 use chrono::{Local, Timelike, Datelike};
 use sha2::{Digest, Sha256};
@@ -9,15 +9,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::pin::Pin;
 use std::future::Future;
-use futures_util::StreamExt;
 use tokio::sync::{mpsc, Mutex};
+use futures_util::StreamExt;
 
 pub enum SchedulerCommand {
     UpdateTasks(Vec<Task>),
     EmailReceived(ReceivedEmail),
     NtfyReceived { topic: String, title: String, message: String, tags: String },
     RunStartupTasks,
-    RunTaskNow(uuid::Uuid),
     Shutdown,
 }
 
@@ -46,36 +45,17 @@ impl Scheduler {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
-                _ = interval.tick() => {
-                    self.check_time_triggers().await;
-                }
+                _ = interval.tick() => self.check_time_triggers().await,
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(SchedulerCommand::UpdateTasks(new_tasks)) => {
-                            let mut tasks = self.tasks.lock().await;
-                            *tasks = new_tasks;
+                            *self.tasks.lock().await = new_tasks;
                         }
-                        Some(SchedulerCommand::EmailReceived(email)) => {
-                            self.handle_email(email).await;
-                        }
+                        Some(SchedulerCommand::EmailReceived(email)) => self.handle_email(email).await,
                         Some(SchedulerCommand::NtfyReceived { topic, title, message, tags }) => {
                             self.handle_ntfy(topic, title, message, tags).await;
                         }
-                        Some(SchedulerCommand::RunStartupTasks) => {
-                            self.run_startup_tasks().await;
-                        }
-                        Some(SchedulerCommand::RunTaskNow(task_id)) => {
-                            let tasks = self.tasks.lock().await;
-                            let task_names: Vec<String> = tasks.iter().map(|t| format!("{}={}", t.id, t.name)).collect();
-                            self.log(format!("Run Now: looking for {} in {} tasks: [{}]", task_id, tasks.len(), task_names.join(", ")));
-                            if let Some(task) = tasks.iter().find(|t| t.id == task_id).cloned() {
-                                drop(tasks);
-                                self.log(format!("Run Now executing task: {}", task.name));
-                                self.execute_task(task).await;
-                            } else {
-                                self.log(format!("Run Now failed: task {} not found in scheduler cache", task_id));
-                            }
-                        }
+                        Some(SchedulerCommand::RunStartupTasks) => self.run_startup_tasks().await,
                         Some(SchedulerCommand::Shutdown) | None => break,
                     }
                 }
@@ -84,13 +64,12 @@ impl Scheduler {
     }
 
     async fn run_startup_tasks(&self) {
-        let tasks = self.tasks.lock().await;
-        let startup_tasks: Vec<Task> = tasks.iter()
+        let tasks: Vec<Task> = self.tasks.lock().await
+            .iter()
             .filter(|t| t.enabled && matches!(t.trigger, TriggerType::Startup))
             .cloned()
             .collect();
-        drop(tasks);
-        for task in startup_tasks {
+        for task in tasks {
             self.execute_task(task).await;
         }
     }
@@ -113,28 +92,21 @@ impl Scheduler {
                     TriggerType::Time { hour, minute } => {
                         let trigger_minute = *hour as u32 * 60 + *minute as u32;
                         current_minute == trigger_minute
-                        && task.last_triggered_date != Some(today)
-                        && current_time.second() == 0
+                            && task.last_triggered_date != Some(today)
+                            && current_time.second() == 0
                     }
                     TriggerType::DaysOfWeek { days, hour, minute } => {
                         let trigger_minute = *hour as u32 * 60 + *minute as u32;
                         days.contains(&current_weekday)
-                        && current_minute == trigger_minute
-                        && task.last_triggered_date != Some(today)
-                        && current_time.second() == 0
+                            && current_minute == trigger_minute
+                            && task.last_triggered_date != Some(today)
+                            && current_time.second() == 0
                     }
                     TriggerType::Interval { minutes } => {
-                        if let Some(last) = task.interval_last_run {
-                            let elapsed = now.signed_duration_since(last).num_minutes() as u64;
-                            elapsed >= *minutes
-                        } else {
-                            true
-                        }
+                        task.interval_last_run
+                            .map_or(true, |last| now.signed_duration_since(last).num_minutes() as u64 >= *minutes)
                     }
-                    TriggerType::Email { .. } => false,
-                    TriggerType::Ntfy { .. } => false,
-                    TriggerType::Startup => false,
-                    TriggerType::OnDemand => false,
+                    _ => false,
                 };
                 if should_run {
                     task.last_triggered_date = Some(today);
@@ -149,26 +121,26 @@ impl Scheduler {
     }
 
     async fn handle_email(&self, email: ReceivedEmail) {
-        let mut to_run = Vec::new();
-        {
-            let tasks = self.tasks.lock().await;
-            for task in tasks.iter() {
-                if !task.enabled {
-                    continue;
+        let email_from = email.from.to_lowercase();
+        let email_subject = email.subject.to_lowercase();
+        let email_body = email.body.to_lowercase();
+
+        let to_run: Vec<Task> = self.tasks.lock().await
+            .iter()
+            .filter(|t| t.enabled)
+            .filter(|t| matches!(t.trigger, TriggerType::Email { .. }))
+            .filter(|t| {
+                if let TriggerType::Email { from_pattern, subject_pattern, body_pattern } = &t.trigger {
+                    (from_pattern.is_empty() || email_from.contains(&from_pattern.to_lowercase()))
+                        && (subject_pattern.is_empty() || email_subject.contains(&subject_pattern.to_lowercase()))
+                        && (body_pattern.is_empty() || email_body.contains(&body_pattern.to_lowercase()))
+                } else {
+                    false
                 }
-                if let TriggerType::Email { from_pattern, subject_pattern, body_pattern } = &task.trigger {
-                    let from_match = from_pattern.is_empty()
-                        || email.from.to_lowercase().contains(&from_pattern.to_lowercase());
-                    let subject_match = subject_pattern.is_empty()
-                        || email.subject.to_lowercase().contains(&subject_pattern.to_lowercase());
-                    let body_match = body_pattern.is_empty()
-                        || email.body.to_lowercase().contains(&body_pattern.to_lowercase());
-                    if from_match && subject_match && body_match {
-                        to_run.push(task.clone());
-                    }
-                }
-            }
-        }
+            })
+            .cloned()
+            .collect();
+
         for task in to_run {
             self.log(format!("Email trigger matched for task: {}", task.name));
             self.execute_task(task).await;
@@ -176,33 +148,29 @@ impl Scheduler {
     }
 
     async fn handle_ntfy(&self, topic: String, title: String, message: String, tags: String) {
-        let mut to_run = Vec::new();
-        {
-            let tasks = self.tasks.lock().await;
-            for task in tasks.iter() {
-                if !task.enabled {
-                    continue;
-                }
-                if let crate::task::TriggerType::Ntfy { server: _, topic: t, title_pattern, message_pattern } = &task.trigger {
-                    if t != &topic {
-                        continue;
-                    }
-                    let title_match = title_pattern.is_empty()
-                        || title.to_lowercase().contains(&title_pattern.to_lowercase());
-                    let msg_match = message_pattern.is_empty()
-                        || message.to_lowercase().contains(&message_pattern.to_lowercase());
-                    if title_match && msg_match {
-                        to_run.push(task.clone());
-                    }
-                }
-            }
-        }
-        let context = crate::task::NtfyContext {
+        let context = NtfyContext {
             topic: topic.clone(),
             title: title.clone(),
             message: message.clone(),
             tags: tags.clone(),
         };
+
+        let to_run: Vec<Task> = self.tasks.lock().await
+            .iter()
+            .filter(|t| t.enabled)
+            .filter(|t| matches!(t.trigger, TriggerType::Ntfy { .. }))
+            .filter(|t| {
+                if let TriggerType::Ntfy { topic: t, title_pattern, message_pattern, .. } = &t.trigger {
+                    t == &topic
+                        && (title_pattern.is_empty() || title.to_lowercase().contains(&title_pattern.to_lowercase()))
+                        && (message_pattern.is_empty() || message.to_lowercase().contains(&message_pattern.to_lowercase()))
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect();
+
         for mut task in to_run {
             task.ntfy_context = Some(context.clone());
             self.log(format!("ntfy trigger matched for task: {}", task.name));
@@ -223,60 +191,9 @@ impl Scheduler {
 
             self.log(format!("Executing task: {}", task.name));
             let ntfy = task.ntfy_context.as_ref();
-            let result = match &task.task_type {
-                TaskType::HttpGet { url } => self.run_http_get(&self.substitute_variables(url, ntfy)).await,
-                TaskType::HttpPost { url, body, headers } => {
-                    self.run_http_post(
-                        &self.substitute_variables(url, ntfy),
-                        &self.substitute_variables(body, ntfy),
-                        &self.substitute_variables(headers, ntfy),
-                    ).await
-                }
-                TaskType::Command { command, args, working_dir } => {
-                    self.run_command(
-                        &self.substitute_variables(command, ntfy),
-                        &self.substitute_variables(args, ntfy),
-                        &self.substitute_variables(working_dir, ntfy),
-                    ).await
-                }
-                TaskType::PathCheck { path, check_file_exists, file_path } => {
-                    self.run_path_check(
-                        &self.substitute_variables(path, ntfy),
-                        *check_file_exists,
-                        &self.substitute_variables(file_path, ntfy),
-                    ).await
-                }
-                TaskType::FileChanged { file_path, baseline_hash } => {
-                    self.run_file_changed(&self.substitute_variables(file_path, ntfy), baseline_hash.as_deref()).await
-                }
-                TaskType::Ntfy { server, topic, title, message, priority, tags, action, subscribe_timeout_secs } => {
-                    self.run_ntfy(
-                        &self.substitute_variables(server, ntfy),
-                        &self.substitute_variables(topic, ntfy),
-                        &self.substitute_variables(title, ntfy),
-                        &self.substitute_variables(message, ntfy),
-                        &self.substitute_variables(priority, ntfy),
-                        &self.substitute_variables(tags, ntfy),
-                        action,
-                        *subscribe_timeout_secs,
-                        ntfy,
-                    ).await
-                }
-                TaskType::GetPublicIp => self.run_get_public_ip().await,
-                TaskType::CloudflareDnsUpdate { zone_id, record_name, record_type, record_id, content, proxied, ttl, api_token_encrypted, api_email_encrypted, .. } => {
-                    self.run_cloudflare_dns_update(
-                        &self.substitute_variables(zone_id, ntfy),
-                        &self.substitute_variables(record_name, ntfy),
-                        record_type,
-                        &self.substitute_variables(record_id, ntfy),
-                        &self.substitute_variables(content, ntfy),
-                        *proxied,
-                        *ttl,
-                        api_token_encrypted.as_ref(),
-                        api_email_encrypted.as_ref(),
-                    ).await
-                }
-            };
+            let public_ip = crate::config::Config::load().public_ip;
+
+            let result = self.run_task_action(&task.task_type, ntfy, public_ip.as_deref()).await;
             let (success, error_msg) = match result {
                 Ok(s) => (s, None),
                 Err(e) => (false, Some(e)),
@@ -289,25 +206,28 @@ impl Scheduler {
             task.last_run = Some(Local::now());
             task.last_result = Some(success);
             task.last_error = error_msg.clone();
+
             if task.pushover_enabled && task.should_notify(success) {
                 if let Some(ref client) = self.pushover {
-                    let title_raw = if success { &task.pushover_title_success } else { &task.pushover_title_failure };
-                    let message_raw = if success { &task.pushover_message_success } else { &task.pushover_message_failure };
-                    let title = self.substitute_variables(title_raw, ntfy);
-                    let message = self.substitute_variables(message_raw, ntfy);
-                    let msg = if let Some(ref err) = error_msg {
-                        format!("{}: {}", message, err)
+                    let (title_raw, msg_raw) = if success {
+                        (&task.pushover_title_success, &task.pushover_message_success)
                     } else {
-                        message
+                        (&task.pushover_title_failure, &task.pushover_message_failure)
                     };
+                    let title = self.substitute_variables(title_raw, ntfy, public_ip.as_deref());
+                    let message = self.substitute_variables(msg_raw, ntfy, public_ip.as_deref());
+                    let msg = error_msg.as_ref()
+                        .map(|e| format!("{}: {}", message, e))
+                        .unwrap_or(message);
                     let _ = client.send(&title, &msg, task.pushover_priority, &task.pushover_sound).await;
                 }
             }
+
             self.log(format!(
                 "Task '{}' completed: {}{}",
                 task.name,
                 if success { "SUCCESS" } else { "FAILURE" },
-                if let Some(ref e) = error_msg { format!(" - {}", e) } else { String::new() }
+                error_msg.as_ref().map_or(String::new(), |e| format!(" - {}", e))
             ));
 
             let mut tasks = self.tasks.lock().await;
@@ -321,22 +241,89 @@ impl Scheduler {
             let on_failure = on_failure_id.and_then(|id| tasks.iter().find(|t| t.id == id).cloned());
             drop(tasks);
 
-            if success {
-                if let Some(mut next) = on_success {
-                    next.ntfy_context = ntfy_context.clone();
-                    self.log(format!("Chaining to success task: {}", next.name));
-                    self.execute_task_with_depth(next, chain_depth + 1).await;
-                }
-            } else {
-                if let Some(mut next) = on_failure {
-                    next.ntfy_context = ntfy_context.clone();
-                    self.log(format!("Chaining to failure task: {}", next.name));
-                    self.execute_task_with_depth(next, chain_depth + 1).await;
-                }
+            let next = if success { on_success } else { on_failure };
+            if let Some(mut next_task) = next {
+                next_task.ntfy_context = ntfy_context.clone();
+                self.log(format!("Chaining to {} task: {}", if success { "success" } else { "failure" }, next_task.name));
+                self.execute_task_with_depth(next_task, chain_depth + 1).await;
             }
         })
     }
 
+    async fn run_task_action(&self, task_type: &TaskType, ntfy: Option<&NtfyContext>, public_ip: Option<&str>) -> Result<bool, String> {
+        match task_type {
+            TaskType::HttpGet { url } => {
+                self.run_http_get(&self.substitute_variables(url, ntfy, public_ip)).await
+            }
+            TaskType::HttpPost { url, body, headers } => {
+                self.run_http_post(
+                    &self.substitute_variables(url, ntfy, public_ip),
+                    &self.substitute_variables(body, ntfy, public_ip),
+                    &self.substitute_variables(headers, ntfy, public_ip),
+                ).await
+            }
+            TaskType::Command { command, args, working_dir } => {
+                self.run_command(
+                    &self.substitute_variables(command, ntfy, public_ip),
+                    &self.substitute_variables(args, ntfy, public_ip),
+                    &self.substitute_variables(working_dir, ntfy, public_ip),
+                ).await
+            }
+            TaskType::PathCheck { path, check_file_exists, file_path } => {
+                self.run_path_check(
+                    &self.substitute_variables(path, ntfy, public_ip),
+                    *check_file_exists,
+                    &self.substitute_variables(file_path, ntfy, public_ip),
+                ).await
+            }
+            TaskType::FileChanged { file_path, baseline_hash } => {
+                self.run_file_changed(&self.substitute_variables(file_path, ntfy, public_ip), baseline_hash.as_deref()).await
+            }
+            TaskType::Ntfy { server, topic, title, message, priority, tags, action, subscribe_timeout_secs } => {
+                self.run_ntfy(
+                    &self.substitute_variables(server, ntfy, public_ip),
+                    &self.substitute_variables(topic, ntfy, public_ip),
+                    &self.substitute_variables(title, ntfy, public_ip),
+                    &self.substitute_variables(message, ntfy, public_ip),
+                    &self.substitute_variables(priority, ntfy, public_ip),
+                    &self.substitute_variables(tags, ntfy, public_ip),
+                    action,
+                    *subscribe_timeout_secs,
+                    ntfy,
+                ).await
+            }
+            TaskType::GetPublicIp => self.run_get_public_ip().await,
+            TaskType::CloudflareDnsUpdate { zone_id, record_name, record_type, record_id, content, proxied, ttl, api_token_encrypted, api_email_encrypted, .. } => {
+                self.run_cloudflare_dns_update(
+                    &self.substitute_variables(zone_id, ntfy, public_ip),
+                    &self.substitute_variables(record_name, ntfy, public_ip),
+                    record_type,
+                    &self.substitute_variables(record_id, ntfy, public_ip),
+                    &self.substitute_variables(content, ntfy, public_ip),
+                    &self.substitute_variables(proxied, ntfy, public_ip),
+                    &self.substitute_variables(ttl, ntfy, public_ip),
+                    api_token_encrypted.as_ref(),
+                    api_email_encrypted.as_ref(),
+                ).await
+            }
+            TaskType::CloudflareIpListUpdate { account_id, list_id, list_name, ip, comment, action, api_token_encrypted, api_email_encrypted, .. } => {
+                self.run_cloudflare_ip_list_update(
+                    &self.substitute_variables(account_id, ntfy, public_ip),
+                    &self.substitute_variables(list_id, ntfy, public_ip),
+                    &self.substitute_variables(list_name, ntfy, public_ip),
+                    &self.substitute_variables(ip, ntfy, public_ip),
+                    &self.substitute_variables(comment, ntfy, public_ip),
+                    action,
+                    api_token_encrypted.as_ref(),
+                    api_email_encrypted.as_ref(),
+                ).await
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // HTTP
+    // ------------------------------------------------------------------
     async fn run_http_get(&self, url: &str) -> Result<bool, String> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -354,62 +341,60 @@ impl Scheduler {
         let mut req = client.post(url).body(body.to_string());
         for line in headers.lines() {
             if let Some(pos) = line.find(':') {
-                let key = line[..pos].trim();
-                let val = line[pos + 1..].trim();
-                req = req.header(key, val);
+                req = req.header(line[..pos].trim(), line[pos + 1..].trim());
             }
         }
         let res = req.send().await.map_err(|e| e.to_string())?;
         Ok(res.status().is_success())
     }
 
+    // ------------------------------------------------------------------
+    // Command
+    // ------------------------------------------------------------------
     async fn run_command(&self, command: &str, args: &str, working_dir: &str) -> Result<bool, String> {
         let output = tokio::task::spawn_blocking({
             let cmd = command.to_string();
             let args = args.to_string();
             let wd = working_dir.to_string();
             move || {
-                let mut command = std::process::Command::new("cmd");
-                command.arg("/C").arg(&cmd);
-                if !args.is_empty() {
-                    command.arg(&args);
-                }
-                if !wd.is_empty() {
-                    command.current_dir(&wd);
-                }
-                command.output()
+                let mut c = std::process::Command::new("cmd");
+                c.arg("/C").arg(&cmd);
+                if !args.is_empty() { c.arg(&args); }
+                if !wd.is_empty() { c.current_dir(&wd); }
+                c.output()
             }
         }).await.map_err(|e| e.to_string())?;
+
         match output {
-            Ok(out) => {
-                if out.status.success() {
-                    Ok(true)
-                } else {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    Err(format!("Command failed: {}", stderr))
-                }
-            }
+            Ok(out) if out.status.success() => Ok(true),
+            Ok(out) => Err(format!("Command failed: {}", String::from_utf8_lossy(&out.stderr))),
             Err(e) => Err(format!("Failed to execute: {}", e)),
         }
     }
 
+    // ------------------------------------------------------------------
+    // Path / File
+    // ------------------------------------------------------------------
     async fn run_path_check(&self, path: &str, check_file: bool, file_path: &str) -> Result<bool, String> {
         let path_exists = tokio::task::spawn_blocking({
             let p = path.to_string();
             move || std::fs::metadata(&p).is_ok()
         }).await.map_err(|e| e.to_string())?;
+
         if !path_exists {
             return Ok(false);
         }
-        if check_file {
-            let file_exists = tokio::task::spawn_blocking({
-                let fp = file_path.to_string();
-                move || std::fs::metadata(&fp).is_ok()
-            }).await.map_err(|e| e.to_string())?;
-            Ok(file_exists)
-        } else {
-            Ok(true)
+        if !check_file {
+            return Ok(true);
         }
+
+        let full = std::path::Path::new(path).join(file_path);
+        let fp_str = full.to_string_lossy().to_string();
+        let file_exists = tokio::task::spawn_blocking({
+            let fp = fp_str;
+            move || std::fs::metadata(&fp).is_ok()
+        }).await.map_err(|e| e.to_string())?;
+        Ok(file_exists)
     }
 
     async fn run_file_changed(&self, file_path: &str, baseline_hash: Option<&str>) -> Result<bool, String> {
@@ -422,31 +407,35 @@ impl Scheduler {
                 Some(hex::encode(hasher.finalize()))
             }
         }).await.map_err(|e| e.to_string())?;
+
         let current_hash = current_hash.ok_or("Cannot read file")?;
         let baseline = baseline_hash.ok_or("No baseline hash set")?;
         Ok(current_hash != baseline)
     }
 
+    // ------------------------------------------------------------------
+    // Public IP
+    // ------------------------------------------------------------------
     async fn run_get_public_ip(&self) -> Result<bool, String> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| e.to_string())?;
-        let res = client.get("https://api.ipify.org")
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let ip = res.text().await.map_err(|e| e.to_string())?.trim().to_string();
+        let ip = client.get("https://api.ipify.org")
+            .send().await.map_err(|e| e.to_string())?
+            .text().await.map_err(|e| e.to_string())?
+            .trim().to_string();
 
         let mut config = crate::config::Config::load();
         config.public_ip = Some(ip.clone());
-        if let Err(e) = config.save() {
-            return Err(format!("Failed to save config: {}", e));
-        }
+        config.save().map_err(|e| format!("Failed to save config: {}", e))?;
         self.log(format!("Public IP updated: {}", ip));
         Ok(true)
     }
 
+    // ------------------------------------------------------------------
+    // Cloudflare
+    // ------------------------------------------------------------------
     async fn run_cloudflare_dns_update(
         &self,
         zone_id: &str,
@@ -454,92 +443,36 @@ impl Scheduler {
         record_type: &str,
         record_id: &str,
         content: &str,
-        proxied: bool,
-        ttl: u32,
+        proxied_str: &str,
+        ttl_str: &str,
         api_token_encrypted: Option<&Vec<u8>>,
         api_email_encrypted: Option<&Vec<u8>>,
     ) -> Result<bool, String> {
-        // Try per-task credentials first
-        let per_task_client = if let (Some(ref pwd), Some(ref salt)) = (&self.master_password, &self.password_salt) {
-            if let Some(ref enc_token) = api_token_encrypted {
-                if let Ok(token) = Crypto::decrypt(enc_token, pwd, salt) {
-                    let email = api_email_encrypted
-                        .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok());
-                    if let Some(ref em) = email {
-                        Some(CloudflareClient::with_global_key(em.clone(), token))
-                    } else {
-                        Some(CloudflareClient::with_token(token))
-                    }
-                } else { None }
-            } else { None }
-        } else { None };
+        let per_task_client = self.decrypt_per_task_client(api_token_encrypted, api_email_encrypted);
+        let client = per_task_client.as_ref().or(self.cloudflare.as_ref())
+            .ok_or("Cloudflare credentials not configured")?;
 
-        let client = per_task_client.as_ref().or(self.cloudflare.as_ref()).ok_or("Cloudflare credentials not configured")?;
         self.log(format!(
             "Cloudflare client: per_task={} global={}",
             per_task_client.is_some(),
             self.cloudflare.is_some()
         ));
 
-        let config = crate::config::Config::load();
-        let mut default_zone_id = config.cloudflare_default_zone_id.clone();
-        let mut default_record_name = config.cloudflare_default_record_name.clone();
-
-        // Fallback: read raw JSON if struct fields are empty (handles old binary overwrite)
-        if default_zone_id.is_empty() || default_record_name.is_empty() {
-            if let Ok(raw) = std::fs::read_to_string(crate::config::Config::config_path()) {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
-                    if default_zone_id.is_empty() {
-                        if let Some(z) = json.get("cloudflare_default_zone_id").and_then(|v| v.as_str()) {
-                            default_zone_id = z.to_string();
-                        }
-                    }
-                    if default_record_name.is_empty() {
-                        if let Some(r) = json.get("cloudflare_default_record_name").and_then(|v| v.as_str()) {
-                            default_record_name = r.to_string();
-                        }
-                    }
-                }
-            }
-        }
-
-        self.log(format!(
-            "Cloudflare defaults loaded: zone_id='{}' record_name='{}'",
-            default_zone_id, default_record_name
-        ));
-
-        let resolved_zone_id = if zone_id.is_empty() {
-            default_zone_id.as_str()
-        } else {
-            zone_id
-        };
-        let resolved_record_name = if record_name.is_empty() {
-            default_record_name.as_str()
-        } else {
-            record_name
-        };
-
-        self.log(format!(
-            "Cloudflare resolved: zone_id='{}' record_name='{}' (task empty: zone={} name={})",
-            resolved_zone_id, resolved_record_name, zone_id.is_empty(), record_name.is_empty()
-        ));
-
-        if resolved_zone_id.is_empty() {
-            return Err("Zone ID is empty and no default is configured in Settings".to_string());
-        }
-        if resolved_record_name.is_empty() {
-            return Err("Record Name is empty and no default is configured in Settings".to_string());
-        }
+        let (resolved_zone_id, resolved_record_name, proxied, ttl) = self.resolve_cloudflare_defaults(zone_id, record_name, proxied_str, ttl_str)?;
 
         let resolved_content = if content.is_empty() {
-            config.public_ip.ok_or("No public IP saved in config. Run a GetPublicIp task first.")?
+            crate::config::Config::load().public_ip
+                .ok_or("No public IP saved in config. Run a GetPublicIp task first.")?
         } else {
-            self.substitute_variables(content, None)
+            content.to_string()
         };
 
         let rid = if record_id.is_empty() {
-            client.find_record_id(resolved_zone_id, resolved_record_name, record_type).await?
-                .ok_or_else(|| format!("Could not find {} record '{}' in zone {}", record_type, resolved_record_name, resolved_zone_id))?
+            client.find_record_id(&resolved_zone_id, &resolved_record_name, record_type).await?
+                .ok_or_else(|| format!(
+                    "Could not find {} record '{}' in zone {}",
+                    record_type, resolved_record_name, resolved_zone_id
+                ))?
         } else {
             record_id.to_string()
         };
@@ -549,28 +482,152 @@ impl Scheduler {
             record_type, resolved_record_name, resolved_zone_id, resolved_content, ttl
         ));
 
-        client.update_dns_record(resolved_zone_id, &rid, record_type, resolved_record_name, &resolved_content, proxied, ttl).await
+        client.update_dns_record(&resolved_zone_id, &rid, record_type, &resolved_record_name, &resolved_content, proxied, ttl).await
     }
 
-    fn substitute_variables(&self, text: &str, ntfy: Option<&crate::task::NtfyContext>) -> String {
-        let config = crate::config::Config::load();
-        let mut result = text.to_string();
-        if let Some(ip) = &config.public_ip {
-            result = result.replace("{{public_ip}}", ip);
+    async fn run_cloudflare_ip_list_update(
+        &self,
+        account_id: &str,
+        list_id: &str,
+        list_name: &str,
+        ip: &str,
+        comment: &str,
+        action: &IpListAction,
+        api_token_encrypted: Option<&Vec<u8>>,
+        api_email_encrypted: Option<&Vec<u8>>,
+    ) -> Result<bool, String> {
+        if account_id.is_empty() {
+            return Err("Account ID is required for IP List operations".to_string());
         }
-        if let Some(ctx) = ntfy {
-            result = result.replace("{{ntfy_topic}}", &ctx.topic);
-            result = result.replace("{{ntfy_title}}", &ctx.title);
-            result = result.replace("{{ntfy_message}}", &ctx.message);
-            for (idx, tag) in ctx.tags.split(',').enumerate() {
-                let tag = tag.trim();
-                let placeholder = format!("{{{{ntfy_tags{}}}}}", idx + 1);
-                result = result.replace(&placeholder, tag);
+        if ip.is_empty() {
+            return Err("IP address is required".to_string());
+        }
+
+        let per_task_client = self.decrypt_per_task_client(api_token_encrypted, api_email_encrypted);
+        let client = per_task_client.as_ref().or(self.cloudflare.as_ref())
+            .ok_or("Cloudflare credentials not configured")?;
+
+        self.log(format!(
+            "Cloudflare IP List: per_task={} global={}",
+            per_task_client.is_some(),
+            self.cloudflare.is_some()
+        ));
+
+        let resolved_list_id = if list_id.is_empty() {
+            if list_name.is_empty() {
+                return Err("Either List ID or List Name must be provided".to_string());
+            }
+            client.find_ip_list_id(account_id, list_name).await?
+                .ok_or_else(|| format!("Could not find IP list named '{}' in account {}", list_name, account_id))?
+        } else {
+            list_id.to_string()
+        };
+
+        self.log(format!(
+            "Cloudflare IP List: {} IP {} to list {} (acct: {})",
+            match action { IpListAction::Add => "Adding", IpListAction::Remove => "Removing", IpListAction::ReplaceAll => "Replacing" },
+            ip, resolved_list_id, account_id
+        ));
+
+        match action {
+            IpListAction::Add => {
+                let (did_something, ok) = client.add_or_update_ip_by_comment(account_id, &resolved_list_id, ip, comment).await?;
+                if !did_something {
+                    self.log(format!("Cloudflare IP List: IP {} already exists in list — no changes made", ip));
+                } else if !comment.is_empty() {
+                    self.log(format!("Cloudflare IP List: added/updated IP {} with comment '{}'", ip, comment));
+                } else {
+                    self.log(format!("Cloudflare IP List: added new IP {} (no comment)", ip));
+                }
+                Ok(ok)
+            }
+            IpListAction::Remove => client.remove_ip_from_list(account_id, &resolved_list_id, ip).await,
+            IpListAction::ReplaceAll => client.replace_ip_list_items(account_id, &resolved_list_id, ip, comment).await,
+        }
+    }
+
+    fn decrypt_per_task_client(&self, api_token_encrypted: Option<&Vec<u8>>, api_email_encrypted: Option<&Vec<u8>>) -> Option<CloudflareClient> {
+        let (pwd, salt) = (self.master_password.as_ref()?, self.password_salt.as_ref()?);
+        let token = api_token_encrypted
+            .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok())?
+            .trim()
+            .to_string();
+        let email = api_email_encrypted
+            .and_then(|enc| Crypto::decrypt(enc, pwd, salt).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        Some(match email {
+            Some(em) => CloudflareClient::with_global_key(em, token),
+            None => CloudflareClient::with_token(token),
+        })
+    }
+
+    fn resolve_cloudflare_defaults(
+        &self,
+        zone_id: &str,
+        record_name: &str,
+        proxied_str: &str,
+        ttl_str: &str,
+    ) -> Result<(String, String, bool, u32), String> {
+        let config = crate::config::Config::load();
+        let mut default_zone_id = config.cloudflare_default_zone_id;
+        let mut default_record_name = config.cloudflare_default_record_name;
+        let mut default_proxied = config.cloudflare_default_proxied;
+        let mut default_ttl = config.cloudflare_default_ttl;
+
+        // Fallback: read raw JSON if struct fields are empty (handles old binary overwrite)
+        if default_zone_id.is_empty() || default_record_name.is_empty() || default_proxied.is_empty() || default_ttl.is_empty() {
+            if let Ok(raw) = std::fs::read_to_string(crate::config::Config::config_path()) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if default_zone_id.is_empty() {
+                        default_zone_id = json.get("cloudflare_default_zone_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    }
+                    if default_record_name.is_empty() {
+                        default_record_name = json.get("cloudflare_default_record_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    }
+                    if default_proxied.is_empty() {
+                        default_proxied = json.get("cloudflare_default_proxied").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    }
+                    if default_ttl.is_empty() {
+                        default_ttl = json.get("cloudflare_default_ttl").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    }
+                }
             }
         }
-        result
+
+        self.log(format!(
+            "Cloudflare defaults loaded: zone_id='{}' record_name='{}' proxied='{}' ttl='{}'",
+            default_zone_id, default_record_name, default_proxied, default_ttl
+        ));
+
+        let zid = if zone_id.is_empty() { &default_zone_id } else { zone_id };
+        let rname = if record_name.is_empty() { &default_record_name } else { record_name };
+        let p_str = if proxied_str.is_empty() { &default_proxied } else { proxied_str };
+        let t_str = if ttl_str.is_empty() { &default_ttl } else { ttl_str };
+
+        self.log(format!(
+            "Cloudflare resolved: zone_id='{}' record_name='{}' proxied='{}' ttl='{}' (task empty: zone={} name={} proxied={} ttl={})",
+            zid, rname, p_str, t_str, zone_id.is_empty(), record_name.is_empty(), proxied_str.is_empty(), ttl_str.is_empty()
+        ));
+
+        if zid.is_empty() {
+            return Err("Zone ID is empty and no default is configured in Settings".to_string());
+        }
+        if rname.is_empty() {
+            return Err("Record Name is empty and no default is configured in Settings".to_string());
+        }
+
+        let proxied = p_str.trim().parse::<bool>()
+            .map_err(|_| format!("Invalid proxied value '{}'. Use 'true' or 'false'.", p_str))?;
+        let ttl = t_str.trim().parse::<u32>()
+            .map_err(|_| format!("Invalid TTL value '{}'. Must be a number.", t_str))?;
+
+        Ok((zid.to_string(), rname.to_string(), proxied, ttl))
     }
 
+    // ------------------------------------------------------------------
+    // ntfy
+    // ------------------------------------------------------------------
     async fn run_ntfy(
         &self,
         server: &str,
@@ -579,13 +636,13 @@ impl Scheduler {
         message: &str,
         priority: &str,
         tags: &str,
-        action: &crate::task::NtfyAction,
+        action: &NtfyAction,
         timeout_secs: u64,
-        ntfy: Option<&crate::task::NtfyContext>,
+        ntfy: Option<&NtfyContext>,
     ) -> Result<bool, String> {
         let base = server.trim_end_matches('/');
         match action {
-            crate::task::NtfyAction::Publish => {
+            NtfyAction::Publish => {
                 let url = format!("{}/{}", base, topic);
                 self.log(format!("ntfy: publishing to {}", url));
                 let client = reqwest::Client::builder()
@@ -593,23 +650,17 @@ impl Scheduler {
                     .build()
                     .map_err(|e| e.to_string())?;
 
-                let sub_title = self.substitute_variables(title, ntfy);
-                let sub_message = self.substitute_variables(message, ntfy);
+                let sub_title = self.substitute_variables(title, ntfy, None);
+                let sub_message = self.substitute_variables(message, ntfy, None);
 
                 let mut req = client.post(&url).body(sub_message);
-                if !sub_title.is_empty() {
-                    req = req.header("Title", sub_title);
-                }
-                if !priority.is_empty() {
-                    req = req.header("Priority", priority);
-                }
-                if !tags.is_empty() {
-                    req = req.header("Tags", tags);
-                }
+                if !sub_title.is_empty() { req = req.header("Title", sub_title); }
+                if !priority.is_empty() { req = req.header("Priority", priority); }
+                if !tags.is_empty() { req = req.header("Tags", tags); }
                 let res = req.send().await.map_err(|e| e.to_string())?;
                 Ok(res.status().is_success())
             }
-            crate::task::NtfyAction::Subscribe => {
+            NtfyAction::Subscribe => {
                 let url = format!("{}/{}/sse", base, topic);
                 let client = reqwest::Client::builder()
                     .timeout(Duration::from_secs(timeout_secs + 5))
@@ -641,6 +692,28 @@ impl Scheduler {
                 Ok(false)
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Variable substitution — now takes public_ip instead of loading config every call
+    // ------------------------------------------------------------------
+    fn substitute_variables(&self, text: &str, ntfy: Option<&NtfyContext>, public_ip: Option<&str>) -> String {
+        let mut result = text.to_string();
+        if let Some(ip) = public_ip {
+            result = result.replace("{{public_ip}}", ip);
+        }
+        if let Some(ctx) = ntfy {
+            result = result.replace("{{ntfy_topic}}", &ctx.topic);
+            result = result.replace("{{ntfy_title}}", &ctx.title);
+            result = result.replace("{{ntfy_message}}", &ctx.message);
+            for (idx, tag) in ctx.tags.split(',').enumerate() {
+                let tag = tag.trim();
+                if !tag.is_empty() {
+                    result = result.replace(&format!("{{{{ntfy_tags{}}}}}", idx + 1), tag);
+                }
+            }
+        }
+        result
     }
 
     fn log(&self, msg: String) {

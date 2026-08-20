@@ -10,6 +10,8 @@ pub struct Config {
     pub cloudflare_api_email_encrypted: Option<Vec<u8>>,
     pub cloudflare_default_zone_id: String,
     pub cloudflare_default_record_name: String,
+    pub cloudflare_default_proxied: String,
+    pub cloudflare_default_ttl: String,
     pub password_verifier: Option<Vec<u8>>,
     pub password_salt: Option<Vec<u8>>,
     pub public_ip: Option<String>,
@@ -17,41 +19,41 @@ pub struct Config {
 }
 
 impl Config {
+    /// Returns a stable base directory for config files.
+    /// Uses the current executable's directory so the service and GUI
+    /// always share the same config regardless of working directory.
     fn base_dir() -> PathBuf {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(PathBuf::from))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     }
 
+    #[inline]
     pub fn config_path() -> PathBuf {
-        let mut path = Self::base_dir();
-        path.push("config.json");
-        path
+        Self::base_dir().join("config.json")
     }
 
+    #[inline]
     pub fn log_dir() -> PathBuf {
-        let mut path = Self::base_dir();
-        path.push("logs");
-        path
+        Self::base_dir().join("logs")
     }
 
+    #[inline]
     pub fn status_path() -> PathBuf {
-        let mut path = Self::base_dir();
-        path.push("status.json");
-        path
+        Self::base_dir().join("status.json")
     }
 
+    #[inline]
     pub fn pid_path() -> PathBuf {
-        let mut path = Self::base_dir();
-        path.push("service.pid");
-        path
+        Self::base_dir().join("service.pid")
     }
 
     pub fn load() -> Self {
         let path = Self::config_path();
-        if path.exists() {
-            if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(config) = serde_json::from_str(&data) {
-                    return config;
-                }
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(config) = serde_json::from_str(&data) {
+                return config;
             }
         }
         Self::default()

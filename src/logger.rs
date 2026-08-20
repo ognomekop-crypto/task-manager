@@ -50,8 +50,7 @@ impl LogManager {
             }
             match rx.recv() {
                 Ok(msg) => {
-                    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
-                    let line = format!("[{}] {}", timestamp, msg);
+                    let line = format!("[{}] {}", Local::now().format("%Y-%m-%d %H:%M:%S"), msg);
                     if let Some(ref mut file) = current_file {
                         let _ = writeln!(file, "{}", line);
                         let _ = file.flush();
@@ -65,16 +64,13 @@ impl LogManager {
 
     fn cleanup_old_logs(log_dir: &PathBuf) {
         let cutoff = Local::now().date_naive() - chrono::Duration::days(7);
-        if let Ok(entries) = fs::read_dir(log_dir) {
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(modified) = meta.modified() {
-                        let dt = chrono::DateTime::<Local>::from(modified).date_naive();
-                        if dt < cutoff {
-                            let _ = fs::remove_file(entry.path());
-                        }
-                    }
-                }
+        let Ok(entries) = fs::read_dir(log_dir) else { return };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(modified) = meta.modified() else { continue };
+            let dt = chrono::DateTime::<Local>::from(modified).date_naive();
+            if dt < cutoff {
+                let _ = fs::remove_file(entry.path());
             }
         }
     }

@@ -138,7 +138,7 @@ async fn handle_client(
                         writer.write_all(b"503 Send HELO/EHLO first\r\n").await.ok();
                     } else {
                         in_data = true;
-                        writer.write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n").await.ok();
+                        writer.write_all(b"354 End data with .\r\n").await.ok();
                     }
                 } else if upper == "QUIT" {
                     writer.write_all(b"221 Bye\r\n").await.ok();

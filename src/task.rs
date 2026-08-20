@@ -43,6 +43,19 @@ impl Default for NtfyAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum IpListAction {
+    Add,
+    Remove,
+    ReplaceAll,
+}
+
+impl Default for IpListAction {
+    fn default() -> Self {
+        IpListAction::Add
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TaskType {
     HttpGet { url: String },
     HttpPost {
@@ -81,8 +94,22 @@ pub enum TaskType {
         record_type: String,
         record_id: String,
         content: String,
-        proxied: bool,
-        ttl: u32,
+        proxied: String,
+        ttl: String,
+        #[serde(skip)]
+        api_token_plain: Option<String>,
+        #[serde(skip)]
+        api_email_plain: Option<String>,
+        api_token_encrypted: Option<Vec<u8>>,
+        api_email_encrypted: Option<Vec<u8>>,
+    },
+    CloudflareIpListUpdate {
+        account_id: String,
+        list_id: String,
+        list_name: String,
+        ip: String,
+        comment: String,
+        action: IpListAction,
         #[serde(skip)]
         api_token_plain: Option<String>,
         #[serde(skip)]
@@ -232,6 +259,15 @@ impl Task {
             TaskType::GetPublicIp => "Get Public IP".to_string(),
             TaskType::CloudflareDnsUpdate { zone_id, record_name, record_type, .. } => {
                 format!("Cloudflare {} {} (zone: {})", record_type, record_name, zone_id)
+            }
+            TaskType::CloudflareIpListUpdate { account_id, list_id, list_name, ip, action, .. } => {
+                let action_str = match action {
+                    IpListAction::Add => "ADD",
+                    IpListAction::Remove => "REM",
+                    IpListAction::ReplaceAll => "REP",
+                };
+                let target = if list_id.is_empty() { list_name } else { list_id };
+                format!("CF IP List {} {} -> {} (acct: {})", action_str, target, ip, account_id)
             }
         }
     }

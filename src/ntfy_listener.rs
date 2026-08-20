@@ -39,56 +39,44 @@ impl NtfyListener {
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(NtfyListenerCommand::UpdateTasks(tasks)) => {
-                            for handle in active_handles.drain(..) {
-                                handle.abort();
-                            }
+                            for handle in active_handles.drain(..) { handle.abort(); }
 
                             let mut subscriptions: HashSet<(String, String)> = HashSet::new();
                             for task in &tasks {
-                                if !task.enabled {
-                                    continue;
-                                }
+                                if !task.enabled { continue; }
                                 if let TriggerType::Ntfy { server, topic, .. } = &task.trigger {
                                     subscriptions.insert((server.clone(), topic.clone()));
                                 }
                             }
 
                             let sub_count = subscriptions.len();
-                            let subs_vec: Vec<(String, String)> = subscriptions.into_iter().collect();
-                            for (server, topic) in subs_vec {
+                            for (server, topic) in subscriptions {
                                 let msg_tx_c = msg_tx.clone();
                                 let log_tx_c = self.log_tx.clone();
-                                let handle = tokio::spawn(async move {
+                                active_handles.push(tokio::spawn(async move {
                                     listen_topic(server, topic, msg_tx_c, log_tx_c).await;
-                                });
-                                active_handles.push(handle);
+                                }));
                             }
 
                             if sub_count > 0 {
-                                let _ = self.log_tx.send(format!(
-                                    "ntfy: monitoring {} topic(s)", sub_count
-                                ));
+                                let _ = self.log_tx.send(format!("ntfy: monitoring {} topic(s)", sub_count));
                             }
                         }
                         None => break,
                     }
                 }
                 Some(msg) = msg_rx.recv() => {
-                    let _ = self.scheduler_tx.send(
-                        SchedulerCommand::NtfyReceived {
-                            topic: msg.topic,
-                            title: msg.title,
-                            message: msg.message,
-                            tags: msg.tags,
-                        }
-                    ).await;
+                    let _ = self.scheduler_tx.send(SchedulerCommand::NtfyReceived {
+                        topic: msg.topic,
+                        title: msg.title,
+                        message: msg.message,
+                        tags: msg.tags,
+                    }).await;
                 }
             }
         }
 
-        for handle in active_handles {
-            handle.abort();
-        }
+        for handle in active_handles { handle.abort(); }
     }
 }
 
@@ -135,7 +123,7 @@ async fn listen_topic(
 
         let _ = log_tx.send(format!("ntfy: SSE stream started for '{}'", topic));
         let mut stream = res.bytes_stream();
-        let mut buffer = Vec::new();
+        let mut buffer: Vec<u8> = Vec::with_capacity(4096);
         let mut last_data = tokio::time::Instant::now();
         let mut chunk_count = 0u64;
 
@@ -153,53 +141,45 @@ async fn listen_topic(
                         ));
                     }
 
-                    // Process all complete events in buffer
-                    loop {
-                        match find_boundary(&buffer) {
-                            Some(pos) => {
-                                let event_bytes = buffer[..pos].to_vec();
-                                // Determine boundary length: \r\n\r\n = 4, \n\n = 2
-                                let boundary_len = if buffer.get(pos..pos+4) == Some(b"\r\n\r\n") {
-                                    4
-                                } else {
-                                    2
-                                };
-                                buffer = buffer[pos + boundary_len..].to_vec();
+                    // Process all complete events in buffer without reallocation
+                    while let Some(pos) = find_boundary(&buffer) {
+                        let boundary_len = if buffer.get(pos..pos + 4) == Some(b"\r\n\r\n") { 4 } else { 2 };
+                        let event_text = String::from_utf8_lossy(&buffer[..pos]);
 
-                                let event_text = String::from_utf8_lossy(&event_bytes);
-                                if let Some(msg) = parse_sse_message(&event_text) {
-                                    let _ = log_tx.send(format!(
-                                        "ntfy: EVENT on '{}': title='{}' msg_len={}",
-                                        topic, msg.title, msg.message.len()
-                                    ));
-                                    let _ = msg_tx.send(NtfyMessage {
-                                        topic: topic.clone(),
-                                        title: msg.title,
-                                        message: msg.message,
-                                        tags: msg.tags,
-                                    }).await;
-                                } else if !event_text.trim().is_empty() {
-                                    let ev_type = event_text.lines()
-                                        .find(|l| l.trim_start().starts_with("event:"))
-                                        .map(|l| l[6..].trim().to_string())
-                                        .unwrap_or_else(|| "(no event type)".to_string());
-                                    let _ = log_tx.send(format!(
-                                        "ntfy: non-message event on '{}': type='{}' first_line='{}'",
-                                        topic, ev_type,
-                                        event_text.lines().next().unwrap_or("").chars().take(60).collect::<String>()
-                                    ));
-                                }
-                            }
-                            None => break,
+                        if let Some(msg) = parse_sse_message(&event_text) {
+                            let _ = log_tx.send(format!(
+                                "ntfy: EVENT on '{}': title='{}' msg_len={}",
+                                topic, msg.title, msg.message.len()
+                            ));
+                            let _ = msg_tx.send(NtfyMessage {
+                                topic: topic.clone(),
+                                title: msg.title,
+                                message: msg.message,
+                                tags: msg.tags,
+                            }).await;
+                        } else if !event_text.trim().is_empty() {
+                            let ev_type = event_text.lines()
+                                .find(|l| l.trim_start().starts_with("event:"))
+                                .map(|l| l[6..].trim().to_string())
+                                .unwrap_or_else(|| "(no event type)".to_string());
+                            let _ = log_tx.send(format!(
+                                "ntfy: non-message event on '{}': type='{}' first_line='{}'",
+                                topic, ev_type,
+                                event_text.lines().next().unwrap_or("").chars().take(60).collect::<String>()
+                            ));
                         }
+
+                        // Drain processed bytes instead of reallocating
+                        let new_start = pos + boundary_len;
+                        buffer.copy_within(new_start.., 0);
+                        buffer.truncate(buffer.len() - new_start);
                     }
 
                     if buffer.len() > 16384 {
-                        let _ = log_tx.send(format!(
-                            "ntfy: buffer overflow on '{}', dropping {} bytes",
-                            topic, buffer.len() - 8192
-                        ));
-                        buffer = buffer[buffer.len() - 8192..].to_vec();
+                        let drop = buffer.len() - 8192;
+                        let _ = log_tx.send(format!("ntfy: buffer overflow on '{}', dropping {} bytes", topic, drop));
+                        buffer.copy_within(drop.., 0);
+                        buffer.truncate(8192);
                     }
                 }
                 Ok(Some(Err(e))) => {
@@ -211,11 +191,8 @@ async fn listen_topic(
                     break;
                 }
                 Err(_) => {
-                    let elapsed = last_data.elapsed().as_secs();
-                    if elapsed > 240 {
-                        let _ = log_tx.send(format!(
-                            "ntfy: stale connection on '{}', reconnecting", topic
-                        ));
+                    if last_data.elapsed().as_secs() > 240 {
+                        let _ = log_tx.send(format!("ntfy: stale connection on '{}', reconnecting", topic));
                         break;
                     }
                 }
@@ -263,7 +240,6 @@ fn parse_sse_message(event_text: &str) -> Option<ParsedNtfyMessage> {
 
     // Per SSE spec: if no event: field is present, default event type is "message"
     let is_message_event = event_type.as_deref().unwrap_or("message") == "message";
-
     if !is_message_event || data_lines.is_empty() {
         return None;
     }
@@ -279,10 +255,10 @@ fn parse_sse_message(event_text: &str) -> Option<ParsedNtfyMessage> {
             msg.message = m.to_string();
         }
         if let Some(tags_arr) = json.get("tags").and_then(|v| v.as_array()) {
-            let tags: Vec<String> = tags_arr.iter()
+            msg.tags = tags_arr.iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-            msg.tags = tags.join(", ");
+                .collect::<Vec<_>>()
+                .join(", ");
         }
     }
 
